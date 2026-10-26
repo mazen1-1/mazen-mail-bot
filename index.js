@@ -11,7 +11,7 @@ const CONFIG = {
   BOT_TOKEN: "8632326691:AAE8jtBuYVRsdALKQ4rOMWHl-v7IN2YEe20",
   CHAT_ID: "8560196010",
   // غيّره إلى قيمة طويلة عشوائية (حروف وأرقام و _ - فقط)
-  WEBHOOK_SECRET: "mazen.2011.4.2",
+  WEBHOOK_SECRET: "mazen_2011_4_2",
   MAX_BODY_CHARS: 3000,
   TELEGRAM_API: "https://api.telegram.org",
 };
