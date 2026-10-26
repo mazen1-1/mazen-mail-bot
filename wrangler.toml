@@ -1,0 +1,3 @@
+name = "mazen-mail-bot"
+main = "index.js"
+compatibility_date = "2026-10-26"
