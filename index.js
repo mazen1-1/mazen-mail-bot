@@ -2,9 +2,10 @@
  * Cloudflare Email Routing  ➜  Telegram Bot  |  Cloudflare Worker (ES Modules)
  *
  * email()                      ← رسائل contact@mazen.design (Email Routing)
- * POST /webhook/telegram       ← تحديثات تيليجرام (الأزرار والأوامر)
+ *                                 يرسل إشعاراً + نص الرسالة + المرفقات (صور وملفات) إلى تليجرام،
+ *                                 ويحوّل نسخة كاملة إلى Gmail.
+ * POST /webhook/telegram       ← تحديثات تيليجرام (زر "تمت القراءة" والأوامر) - اختياري
  * GET  /                       ← Health check
- * GET  /debug                  ← مؤقت: يعرض أسماء وأطوال المتغيرات (احذفه بعد الإصلاح)
  *
  * Secrets المطلوبة (Runtime):
  *   BOT_TOKEN, CHAT_ID, WEBHOOK_SECRET, GMAIL_DEST
@@ -13,8 +14,13 @@
 import PostalMime from "postal-mime";
 
 const MAX_BODY_CHARS = 3000;
-const MAX_RAW = 5 * 1024 * 1024; // لا نحلل الرسائل الأكبر من 5MB
+const MAX_RAW = 15 * 1024 * 1024;        // لا نحلل الرسائل الأكبر من 15MB
+const MAX_ATTACHMENTS = 10;              // أقصى عدد مرفقات تُرسل إلى تليجرام
+const MAX_PHOTO_BYTES = 10 * 1024 * 1024; // حد sendPhoto في تليجرام
+const MAX_FILE_BYTES = 50 * 1024 * 1024;  // حد sendDocument للبوتات
+const MIN_INLINE_BYTES = 20 * 1024;       // نتجاهل صور التوقيع الصغيرة المضمّنة
 const TELEGRAM_API = "https://api.telegram.org";
+const PHOTO_TYPES = ["image/jpeg", "image/png", "image/webp"];
 
 // ───────────── أدوات مساعدة ─────────────
 const json = (data, status = 200) =>
@@ -58,6 +64,33 @@ const safeEqual = (a = "", b = "") => {
   return diff === 0;
 };
 
+// فك ترميز عناوين MIME مثل =?UTF-8?B?...?= (احتياط للرسائل الكبيرة)
+function decodeMime(str = "") {
+  return String(str)
+    .replace(/(\?=)\s+(=\?)/g, "$1$2")
+    .replace(/=\?([^?]+)\?([BbQq])\?([^?]*)\?=/g, (_, charset, enc, data) => {
+      try {
+        let bytes;
+        if (enc.toUpperCase() === "B") {
+          bytes = Uint8Array.from(atob(data), (c) => c.charCodeAt(0));
+        } else {
+          const q = data
+            .replace(/_/g, " ")
+            .replace(/=([0-9A-Fa-f]{2})/g, (_m, h) => String.fromCharCode(parseInt(h, 16)));
+          bytes = Uint8Array.from(q, (c) => c.charCodeAt(0));
+        }
+        return new TextDecoder(charset).decode(bytes);
+      } catch {
+        return data;
+      }
+    });
+}
+
+const formatSize = (bytes) =>
+  bytes >= 1024 * 1024
+    ? `${(bytes / 1024 / 1024).toFixed(1)}MB`
+    : `${Math.max(1, Math.round(bytes / 1024))}KB`;
+
 // ───────────── Telegram API ─────────────
 async function telegram(env, method, payload) {
   const token = clean(env.BOT_TOKEN);
@@ -75,6 +108,29 @@ async function telegram(env, method, payload) {
   return data.result;
 }
 
+// رفع ملف إلى تليجرام (multipart)
+async function telegramUpload(env, method, field, { bytes, type, filename }, extra = {}) {
+  const token = clean(env.BOT_TOKEN);
+  if (!token) throw new Error("BOT_TOKEN is empty (secret not reaching the Worker)");
+
+  const form = new FormData();
+  form.append("chat_id", clean(env.CHAT_ID));
+  for (const [k, v] of Object.entries(extra)) {
+    if (v !== undefined && v !== null) form.append(k, String(v));
+  }
+  form.append(field, new Blob([bytes], { type }), filename);
+
+  const res = await fetch(`${TELEGRAM_API}/bot${token}/${method}`, {
+    method: "POST",
+    body: form,
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || !data.ok) {
+    throw new Error(`Telegram ${method} failed: ${res.status} ${data.description ?? ""}`);
+  }
+  return data.result;
+}
+
 const sendMessage = (env, text, extra = {}) =>
   telegram(env, "sendMessage", {
     chat_id: clean(env.CHAT_ID),
@@ -84,7 +140,43 @@ const sendMessage = (env, text, extra = {}) =>
     ...extra,
   });
 
-// ───────────── معالج تيليجرام ─────────────
+// إرسال مرفق واحد: صورة إن أمكن، وإلا كملف
+async function sendAttachment(env, att, replyToId) {
+  const type = (att.mimeType || "application/octet-stream").toLowerCase();
+  const bytes =
+    typeof att.content === "string" ? new TextEncoder().encode(att.content) : att.content;
+  const size = bytes.byteLength;
+  const filename = att.filename || `attachment.${type.split("/")[1] || "bin"}`;
+  const extra = {
+    caption: `📎 ${filename} (${formatSize(size)})`,
+    ...(replyToId ? { reply_to_message_id: replyToId } : {}),
+  };
+
+  if (size > MAX_FILE_BYTES) {
+    await sendMessage(
+      env,
+      `⚠️ المرفق <code>${escapeHtml(filename)}</code> (${formatSize(size)}) أكبر من حد تليجرام، افتحه من Gmail.`,
+      replyToId ? { reply_to_message_id: replyToId } : {}
+    );
+    return;
+  }
+
+  const file = { bytes, type, filename };
+
+  if (PHOTO_TYPES.includes(type) && size <= MAX_PHOTO_BYTES) {
+    try {
+      await telegramUpload(env, "sendPhoto", "photo", file, extra);
+      return;
+    } catch (err) {
+      // أبعاد غير مقبولة كصورة: نرسلها كملف بدلاً من ذلك
+      console.error("sendPhoto failed, falling back to document:", err.message);
+    }
+  }
+
+  await telegramUpload(env, "sendDocument", "document", file, extra);
+}
+
+// ───────────── معالج تيليجرام (اختياري) ─────────────
 async function handleTelegram(request, env) {
   // 1) التأكد أن الطلب قادم فعلاً من تيليجرام
   const secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token") ?? "";
@@ -141,20 +233,6 @@ export default {
       if (request.method === "GET" && pathname === "/") {
         return json({ ok: true, service: "mazen-mail-bot" });
       }
-
-      // مؤقت: تشخيص الأسرار (أسماء وأطوال فقط، بدون قيم)
-      if (request.method === "GET" && pathname === "/debug") {
-        return json({
-          keys: Object.keys(env),
-          tokenLen: clean(env.BOT_TOKEN).length,
-          tokenHasColon: clean(env.BOT_TOKEN).includes(":"),
-          chatIdLen: clean(env.CHAT_ID).length,
-          webhookSecretLen: clean(env.WEBHOOK_SECRET).length,
-          destLen: clean(env.GMAIL_DEST).length,
-          destHasAt: clean(env.GMAIL_DEST).includes("@"),
-        });
-      }
-
       if (request.method === "POST" && pathname === "/webhook/telegram") {
         return await handleTelegram(request, env);
       }
@@ -168,50 +246,83 @@ export default {
 
   // رسائل Cloudflare Email Routing
   async email(message, env) {
-    console.log("env check", {
-      tokenLen: clean(env.BOT_TOKEN).length,
-      tokenHasColon: clean(env.BOT_TOKEN).includes(":"),
-      chatIdLen: clean(env.CHAT_ID).length,
-      destLen: clean(env.GMAIL_DEST).length,
-      destHasAt: clean(env.GMAIL_DEST).includes("@"),
-    });
-
     try {
-      const subject = message.headers.get("subject") || "(بدون موضوع)";
+      let subject = decodeMime(message.headers.get("subject") || "");
+      let fromName = "";
+      let fromAddr = message.from;
       let content = "(الرسالة كبيرة، افتحها من Gmail)";
-      let attachments = 0;
+      let attachments = [];
+      let skippedInline = 0;
 
       if (message.rawSize <= MAX_RAW) {
         const raw = await new Response(message.raw).arrayBuffer();
         const mail = await PostalMime.parse(raw);
+        subject = mail.subject || subject;
+        fromName = mail.from?.name || "";
+        fromAddr = mail.from?.address || fromAddr;
         content =
           (mail.text || "").trim() || stripHtml(mail.html || "") || "(لا يوجد محتوى)";
-        attachments = mail.attachments?.length ?? 0;
+
+        // نتجاهل صور التوقيع الصغيرة المضمّنة (inline) ونرسل الباقي
+        for (const att of mail.attachments ?? []) {
+          const size = att.content?.byteLength ?? String(att.content ?? "").length;
+          if (att.disposition === "inline" && att.contentId && size < MIN_INLINE_BYTES) {
+            skippedInline++;
+            continue;
+          }
+          attachments.push(att);
+        }
+      } else if (message.rawSize > MAX_RAW) {
+        content = `(الرسالة كبيرة ${formatSize(message.rawSize)}، افتحها وحمّل مرفقاتها من Gmail)`;
       }
+
+      const toSend = attachments.slice(0, MAX_ATTACHMENTS);
+      const fromDisplay = fromName ? `${fromName} <${fromAddr}>` : fromAddr;
 
       const text = [
         "🔔 <b>رسالة بريد جديدة</b>",
         "━━━━━━━━━━━━━━",
-        `👤 <b>من:</b> ${escapeHtml(message.from)}`,
+        `👤 <b>من:</b> ${escapeHtml(fromDisplay)}`,
         `📬 <b>إلى:</b> ${escapeHtml(message.to)}`,
-        `📌 <b>الموضوع:</b> ${escapeHtml(subject)}`,
-        attachments ? `📎 <b>مرفقات:</b> ${attachments}` : null,
+        `📌 <b>الموضوع:</b> ${escapeHtml(subject || "(بدون موضوع)")}`,
+        attachments.length ? `📎 <b>مرفقات:</b> ${attachments.length}` : null,
         "━━━━━━━━━━━━━━",
         `<blockquote expandable>${escapeHtml(truncate(content, MAX_BODY_CHARS))}</blockquote>`,
       ]
-        .filter(Boolean)
+        .filter((l) => l !== null)
         .join("\n");
 
-      await sendMessage(env, text, {
+      const sent = await sendMessage(env, text, {
         reply_markup: {
           inline_keyboard: [[{ text: "✅ تمت القراءة", callback_data: "mail_read" }]],
         },
       });
+
+      // المرفقات تصل كردود على الإشعار
+      for (const att of toSend) {
+        try {
+          await sendAttachment(env, att, sent?.message_id);
+        } catch (err) {
+          console.error("attachment failed:", att.filename, err.message);
+          await sendMessage(
+            env,
+            `⚠️ تعذّر إرسال المرفق <code>${escapeHtml(att.filename || "attachment")}</code>، افتحه من Gmail.`,
+            sent?.message_id ? { reply_to_message_id: sent.message_id } : {}
+          ).catch(() => {});
+        }
+      }
+
+      if (attachments.length > MAX_ATTACHMENTS) {
+        await sendMessage(
+          env,
+          `ℹ️ أُرسل أول ${MAX_ATTACHMENTS} مرفقات فقط من ${attachments.length}، والباقي في Gmail.`
+        ).catch(() => {});
+      }
     } catch (err) {
       console.error("Email error:", err.message);
     }
 
-    // تصل نسخة إلى Gmail حتى لو فشل تليجرام
+    // تصل نسخة كاملة (بكل المرفقات) إلى Gmail حتى لو فشل تليجرام
     try {
       await message.forward(clean(env.GMAIL_DEST));
     } catch (err) {
