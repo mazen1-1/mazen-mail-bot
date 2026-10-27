@@ -1,20 +1,19 @@
 /**
- * Zoho Mail  ➜  Telegram Bot  |  Cloudflare Worker (ES Modules)
- * Endpoints:
- *   POST /webhook/email?key=SECRET   ← Zoho Mail
- *   POST /webhook/telegram           ← Telegram (يتحقق عبر Secret Token + Chat ID)
- *   GET  /                           ← Health check
+ * Cloudflare Email Routing  ➜  Telegram Bot  |  Cloudflare Worker (ES Modules)
+ *
+ * email()                      ← رسائل contact@mazen.design (Email Routing)
+ * POST /webhook/telegram       ← تحديثات تيليجرام (الأزرار والأوامر)
+ * GET  /                       ← Health check
+ *
+ * كل القيم الحساسة تأتي من Secrets (env) وليست مكتوبة في الكود:
+ *   BOT_TOKEN, CHAT_ID, WEBHOOK_SECRET, GMAIL_DEST
  */
 
-// ───────────── الإعدادات ─────────────
-const CONFIG = {
-  BOT_TOKEN: "8632326691:AAE8jtBuYVRsdALKQ4rOMWHl-v7IN2YEe20",
-  CHAT_ID: "8560196010",
-  // غيّره إلى قيمة طويلة عشوائية (حروف وأرقام و _ - فقط)
-  WEBHOOK_SECRET: "mazen_2011_4_2",
-  MAX_BODY_CHARS: 3000,
-  TELEGRAM_API: "https://api.telegram.org",
-};
+import PostalMime from "postal-mime";
+
+const MAX_BODY_CHARS = 3000;
+const MAX_RAW = 5 * 1024 * 1024; // لا نحلل الرسائل الأكبر من 5MB
+const TELEGRAM_API = "https://api.telegram.org";
 
 // ───────────── أدوات مساعدة ─────────────
 const json = (data, status = 200) =>
@@ -55,22 +54,9 @@ const safeEqual = (a = "", b = "") => {
   return diff === 0;
 };
 
-// قراءة JSON أو Form-data بشكل مرن
-async function parsePayload(request) {
-  const type = request.headers.get("content-type") || "";
-  if (type.includes("application/json")) return await request.json();
-  if (type.includes("form")) return Object.fromEntries(await request.formData());
-  const text = await request.text();
-  try {
-    return JSON.parse(text);
-  } catch {
-    return Object.fromEntries(new URLSearchParams(text));
-  }
-}
-
 // ───────────── Telegram API ─────────────
-async function telegram(method, payload) {
-  const res = await fetch(`${CONFIG.TELEGRAM_API}/bot${CONFIG.BOT_TOKEN}/${method}`, {
+async function telegram(env, method, payload) {
+  const res = await fetch(`${TELEGRAM_API}/bot${env.BOT_TOKEN}/${method}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
@@ -82,52 +68,20 @@ async function telegram(method, payload) {
   return data.result;
 }
 
-const sendMessage = (text, extra = {}) =>
-  telegram("sendMessage", {
-    chat_id: CONFIG.CHAT_ID,
+const sendMessage = (env, text, extra = {}) =>
+  telegram(env, "sendMessage", {
+    chat_id: env.CHAT_ID,
     text,
     parse_mode: "HTML",
     disable_web_page_preview: true,
     ...extra,
   });
 
-// ───────────── معالج الإيميل ─────────────
-async function handleEmail(request) {
-  const url = new URL(request.url);
-  if (!safeEqual(url.searchParams.get("key") ?? "", CONFIG.WEBHOOK_SECRET)) {
-    return json({ ok: false, error: "Unauthorized" }, 401);
-  }
-
-  const body = await parsePayload(request);
-
-  const from = body.from ?? body.sender ?? body.fromAddress ?? "غير معروف";
-  const subject = body.subject ?? "(بدون موضوع)";
-  const raw = body.content ?? body.html ?? body.summary ?? body.text ?? "";
-  const content = truncate(stripHtml(raw) || "(لا يوجد محتوى)", CONFIG.MAX_BODY_CHARS);
-
-  const message = [
-    "🔔 <b>رسالة بريد جديدة</b>",
-    "━━━━━━━━━━━━━━",
-    `👤 <b>من:</b> ${escapeHtml(from)}`,
-    `📌 <b>الموضوع:</b> ${escapeHtml(subject)}`,
-    "━━━━━━━━━━━━━━",
-    `<blockquote expandable>${escapeHtml(content)}</blockquote>`,
-  ].join("\n");
-
-  await sendMessage(message, {
-    reply_markup: {
-      inline_keyboard: [[{ text: "✅ تمت القراءة", callback_data: "mail_read" }]],
-    },
-  });
-
-  return json({ ok: true });
-}
-
 // ───────────── معالج تيليجرام ─────────────
-async function handleTelegram(request) {
+async function handleTelegram(request, env) {
   // 1) التأكد أن الطلب قادم فعلاً من تيليجرام
   const secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token") ?? "";
-  if (!safeEqual(secret, CONFIG.WEBHOOK_SECRET)) {
+  if (!safeEqual(secret, env.WEBHOOK_SECRET ?? "")) {
     return json({ ok: false, error: "Unauthorized" }, 401);
   }
 
@@ -135,64 +89,100 @@ async function handleTelegram(request) {
   const msg = update.message ?? update.edited_message;
   const cb = update.callback_query;
 
-  // 2) تأكيد الهوية: نقبل فقط صاحب الـ Chat ID
+  // 2) نقبل فقط صاحب الـ Chat ID
   const senderChatId = String(msg?.chat?.id ?? cb?.message?.chat?.id ?? "");
-  if (senderChatId !== CONFIG.CHAT_ID) {
-    return json({ ok: true, ignored: "unauthorized_chat" }); // 200 لمنع إعادة المحاولة
+  if (senderChatId !== String(env.CHAT_ID)) {
+    return json({ ok: true, ignored: "unauthorized_chat" });
   }
 
   // 3) أزرار التفاعل
   if (cb) {
     if (cb.data === "mail_read") {
-      await telegram("answerCallbackQuery", {
+      await telegram(env, "answerCallbackQuery", {
         callback_query_id: cb.id,
         text: "تم ✅",
       });
-      await telegram("editMessageReplyMarkup", {
+      await telegram(env, "editMessageReplyMarkup", {
         chat_id: cb.message.chat.id,
         message_id: cb.message.message_id,
         reply_markup: { inline_keyboard: [] },
       });
     } else {
-      await telegram("answerCallbackQuery", { callback_query_id: cb.id });
+      await telegram(env, "answerCallbackQuery", { callback_query_id: cb.id });
     }
     return json({ ok: true });
   }
 
-  // 4) الأوامر والرسائل النصية
+  // 4) الأوامر
   if (msg?.text) {
     const cmd = msg.text.trim().split(/\s+/)[0].split("@")[0].toLowerCase();
     const replies = {
-      "/start": "👋 أهلاً مازن! البوت يعمل وسيصلك كل بريد جديد من Zoho هنا.",
+      "/start": "👋 أهلاً مازن! البوت يعمل وسيصلك كل بريد جديد على contact@mazen.design هنا.",
       "/ping": "🏓 pong — الـ Worker يعمل بشكل سليم.",
     };
-    await sendMessage(replies[cmd] ?? "ℹ️ الأوامر المتاحة: /start ، /ping");
+    await sendMessage(env, replies[cmd] ?? "ℹ️ الأوامر المتاحة: /start ، /ping");
   }
 
   return json({ ok: true });
 }
 
-// ───────────── نقطة الدخول والتوجيه ─────────────
+// ───────────── نقطة الدخول ─────────────
 export default {
-  async fetch(request) {
+  async fetch(request, env) {
     const { pathname } = new URL(request.url);
-
     try {
       if (request.method === "GET" && pathname === "/") {
-        return json({ ok: true, service: "zoho-telegram-bridge" });
-      }
-      if (request.method === "POST" && pathname === "/webhook/email") {
-        return await handleEmail(request);
+        return json({ ok: true, service: "mazen-mail-bot" });
       }
       if (request.method === "POST" && pathname === "/webhook/telegram") {
-        return await handleTelegram(request);
+        return await handleTelegram(request, env);
       }
       return json({ ok: false, error: "Not Found" }, 404);
     } catch (err) {
       console.error("Worker error:", err.message);
-      // 500 للإيميل ليعيد Zoho المحاولة، و200 لتيليجرام لتجنب تكرار التحديثات
-      const status = pathname === "/webhook/telegram" ? 200 : 500;
-      return json({ ok: false, error: "Internal Error" }, status);
+      // 200 لتجنب تكرار التحديثات من تيليجرام
+      return json({ ok: false, error: "Internal Error" }, 200);
     }
+  },
+
+  // رسائل Cloudflare Email Routing
+  async email(message, env) {
+    try {
+      const subject = message.headers.get("subject") || "(بدون موضوع)";
+      let content = "(الرسالة كبيرة، افتحها من Gmail)";
+      let attachments = 0;
+
+      if (message.rawSize <= MAX_RAW) {
+        const raw = await new Response(message.raw).arrayBuffer();
+        const mail = await PostalMime.parse(raw);
+        content =
+          (mail.text || "").trim() || stripHtml(mail.html || "") || "(لا يوجد محتوى)";
+        attachments = mail.attachments?.length ?? 0;
+      }
+
+      const text = [
+        "🔔 <b>رسالة بريد جديدة</b>",
+        "━━━━━━━━━━━━━━",
+        `👤 <b>من:</b> ${escapeHtml(message.from)}`,
+        `📬 <b>إلى:</b> ${escapeHtml(message.to)}`,
+        `📌 <b>الموضوع:</b> ${escapeHtml(subject)}`,
+        attachments ? `📎 <b>مرفقات:</b> ${attachments}` : null,
+        "━━━━━━━━━━━━━━",
+        `<blockquote expandable>${escapeHtml(truncate(content, MAX_BODY_CHARS))}</blockquote>`,
+      ]
+        .filter(Boolean)
+        .join("\n");
+
+      await sendMessage(env, text, {
+        reply_markup: {
+          inline_keyboard: [[{ text: "✅ تمت القراءة", callback_data: "mail_read" }]],
+        },
+      });
+    } catch (err) {
+      console.error("Email error:", err.message);
+    }
+
+    // تصل نسخة إلى Gmail حتى لو فشل تليجرام
+    await message.forward(env.GMAIL_DEST);
   },
 };

@@ -1,0 +1,7 @@
+{
+  "name": "mazen-mail-bot",
+  "private": true,
+  "dependencies": {
+    "postal-mime": "^2.4.0"
+  }
+}
