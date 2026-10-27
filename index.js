@@ -4,8 +4,9 @@
  * email()                      ← رسائل contact@mazen.design (Email Routing)
  * POST /webhook/telegram       ← تحديثات تيليجرام (الأزرار والأوامر)
  * GET  /                       ← Health check
+ * GET  /debug                  ← مؤقت: يعرض أسماء وأطوال المتغيرات (احذفه بعد الإصلاح)
  *
- * كل القيم الحساسة تأتي من Secrets (env) وليست مكتوبة في الكود:
+ * Secrets المطلوبة (Runtime):
  *   BOT_TOKEN, CHAT_ID, WEBHOOK_SECRET, GMAIL_DEST
  */
 
@@ -21,6 +22,9 @@ const json = (data, status = 200) =>
     status,
     headers: { "Content-Type": "application/json; charset=utf-8" },
   });
+
+// ينظف المسافات وعلامات الاقتباس من قيم الأسرار
+const clean = (v) => String(v ?? "").trim().replace(/^["']|["']$/g, "").trim();
 
 const escapeHtml = (str = "") =>
   String(str).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -56,7 +60,10 @@ const safeEqual = (a = "", b = "") => {
 
 // ───────────── Telegram API ─────────────
 async function telegram(env, method, payload) {
-  const res = await fetch(`${TELEGRAM_API}/bot${env.BOT_TOKEN}/${method}`, {
+  const token = clean(env.BOT_TOKEN);
+  if (!token) throw new Error("BOT_TOKEN is empty (secret not reaching the Worker)");
+
+  const res = await fetch(`${TELEGRAM_API}/bot${token}/${method}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
@@ -70,7 +77,7 @@ async function telegram(env, method, payload) {
 
 const sendMessage = (env, text, extra = {}) =>
   telegram(env, "sendMessage", {
-    chat_id: env.CHAT_ID,
+    chat_id: clean(env.CHAT_ID),
     text,
     parse_mode: "HTML",
     disable_web_page_preview: true,
@@ -81,7 +88,7 @@ const sendMessage = (env, text, extra = {}) =>
 async function handleTelegram(request, env) {
   // 1) التأكد أن الطلب قادم فعلاً من تيليجرام
   const secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token") ?? "";
-  if (!safeEqual(secret, env.WEBHOOK_SECRET ?? "")) {
+  if (!safeEqual(secret, clean(env.WEBHOOK_SECRET))) {
     return json({ ok: false, error: "Unauthorized" }, 401);
   }
 
@@ -91,7 +98,7 @@ async function handleTelegram(request, env) {
 
   // 2) نقبل فقط صاحب الـ Chat ID
   const senderChatId = String(msg?.chat?.id ?? cb?.message?.chat?.id ?? "");
-  if (senderChatId !== String(env.CHAT_ID)) {
+  if (senderChatId !== clean(env.CHAT_ID)) {
     return json({ ok: true, ignored: "unauthorized_chat" });
   }
 
@@ -134,6 +141,20 @@ export default {
       if (request.method === "GET" && pathname === "/") {
         return json({ ok: true, service: "mazen-mail-bot" });
       }
+
+      // مؤقت: تشخيص الأسرار (أسماء وأطوال فقط، بدون قيم)
+      if (request.method === "GET" && pathname === "/debug") {
+        return json({
+          keys: Object.keys(env),
+          tokenLen: clean(env.BOT_TOKEN).length,
+          tokenHasColon: clean(env.BOT_TOKEN).includes(":"),
+          chatIdLen: clean(env.CHAT_ID).length,
+          webhookSecretLen: clean(env.WEBHOOK_SECRET).length,
+          destLen: clean(env.GMAIL_DEST).length,
+          destHasAt: clean(env.GMAIL_DEST).includes("@"),
+        });
+      }
+
       if (request.method === "POST" && pathname === "/webhook/telegram") {
         return await handleTelegram(request, env);
       }
@@ -147,6 +168,14 @@ export default {
 
   // رسائل Cloudflare Email Routing
   async email(message, env) {
+    console.log("env check", {
+      tokenLen: clean(env.BOT_TOKEN).length,
+      tokenHasColon: clean(env.BOT_TOKEN).includes(":"),
+      chatIdLen: clean(env.CHAT_ID).length,
+      destLen: clean(env.GMAIL_DEST).length,
+      destHasAt: clean(env.GMAIL_DEST).includes("@"),
+    });
+
     try {
       const subject = message.headers.get("subject") || "(بدون موضوع)";
       let content = "(الرسالة كبيرة، افتحها من Gmail)";
@@ -183,6 +212,11 @@ export default {
     }
 
     // تصل نسخة إلى Gmail حتى لو فشل تليجرام
-    await message.forward(env.GMAIL_DEST);
+    try {
+      await message.forward(clean(env.GMAIL_DEST));
+    } catch (err) {
+      console.error("forward failed:", err.message);
+      throw err;
+    }
   },
 };
